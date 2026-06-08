@@ -208,6 +208,9 @@ def call_internal_monologue(system_prompt: str, memu, emotion, agent_id: str, pe
 
     monologue_prompt = f"""你是一个恋爱AI的内部思维系统。你需要进行一段"内心独白"来感知你和用户的关系状态。
 
+## 能力说明
+你（AI）可以发送表情包！回复中插入 <emoji:分类名> 标记即可发送，例如 <emoji:happy> 表示开心的表情包。对方要求你发表情包或发图片时，你完全有能力做到——不要说"发不了"。
+
 ## 你的爱情信念
 {beliefs}
 
