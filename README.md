@@ -305,8 +305,8 @@ graph TD
     REPLY --> ANNIVERSARY
     REPLY -->|LLM 调用| LLM
     MEMU --> EMBED
-    各引擎 --> SQLITE
-    各引擎 --> JSON
+    REPLY --> SQLITE
+    REPLY --> JSON
 ```
 
 ### 技术栈
