@@ -110,7 +110,7 @@ Routine Learner 持续分析用户的活跃时间规律：
 
 ```bash
 # 克隆项目
-git clone https://github.com/你的用户名/Soft-Ripe-Timezone.git
+git clone https://github.com/yang493kjs/Soft-Ripe-Timezone.git
 cd Soft-Ripe-Timezone
 
 # 直接双击 start.bat
