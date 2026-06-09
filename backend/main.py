@@ -1241,7 +1241,7 @@ async def _auto_load_vision_model(model: str):
     logger.info(f"正在加载视觉模型: {model} ({model_id}) ...")
     VISION_MODEL_INSTANCE = Qwen3VLForConditionalGeneration.from_pretrained(
         model_id, cache_dir=str(VISION_CACHE_DIR), device_map=device_map,
-        torch_dtype=torch.bfloat16, quantization_config=bnb_config
+        dtype=torch.bfloat16, quantization_config=bnb_config
     )
     VISION_PROCESSOR_INSTANCE = AutoProcessor.from_pretrained(model_id, cache_dir=str(VISION_CACHE_DIR))
     VISION_CURRENT_MODEL = model
