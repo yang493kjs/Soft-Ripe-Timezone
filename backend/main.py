@@ -209,13 +209,25 @@ async def lifespan(app: FastAPI):
     _init_users_file()
     init_db()
     logger.info("SQLite 数据库已初始化")
+    logger.info("正在加载模型，耐心等待...")
 
     import asyncio
     from settings import _get_local_embed_model
     await asyncio.to_thread(_get_local_embed_model)
     logger.info("Embedding 模型已预加载完成")
 
+    # 自动加载管理员配置的视觉模型
     cfg = load_config()
+    vision_model = cfg.get("vision_model", "")
+    if vision_model:
+        logger.info(f"检测到视觉模型配置: {vision_model}，正在自动加载...")
+        try:
+            await _auto_load_vision_model(vision_model)
+        except Exception as e:
+            logger.warning(f"视觉模型自动加载失败: {e}，可稍后在管理员界面手动加载")
+
+    logger.info("所有模型加载完成，服务就绪")
+
     api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")
     model = cfg.get("model") or os.environ.get("LLM_MODEL", "")
@@ -749,7 +761,8 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
             add_to_recall(agent_id, "user", image_result["text"])
         elif image_result.get("human_hint"):
             augmented_message = req.message + "\n" + image_result["human_hint"]
-            add_to_recall(agent_id, "user", image_result["human_hint"])
+            # 注意：失败提示不存入 recall，它是系统指令而非用户说的话
+            # 否则后续即使识别成功，AI 仍会从 recall 中读到此提示并误以为自己看不到图片
 
     if req.message:
         urls_result = process_urls_in_message(req.message)
@@ -944,6 +957,9 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     )
 
     # ==================== 表情包解析 ====================
+    if not ai_content or not ai_content.strip():
+        logger.warning(f"[空回复] AI返回空内容，使用兜底回复")
+        ai_content = "嗯……我看到了，但现在有点不知道该怎么回应。要不要换个话题聊聊？"
     ai_content_clean, emoji_list = replace_emoji_tags(ai_content)
     if emoji_list:
         print(f"[表情引擎] 检测到 {len(emoji_list)} 个表情: {[e['category'] for e in emoji_list]}")
@@ -961,6 +977,8 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
         "timestamp": datetime.now().strftime("%H:%M"),
         "date": "今天"
     }
+    if emoji_list:
+        ai_msg["emojis"] = emoji_list
     save_message(agent_id, ai_msg)
 
     add_to_recall(agent_id, "assistant", ai_content_clean)
@@ -1199,6 +1217,37 @@ VISION_PROCESSOR_INSTANCE = None
 VISION_CURRENT_MODEL = None
 
 
+async def _auto_load_vision_model(model: str):
+    """自动加载视觉模型（启动时调用）"""
+    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
+    if not model or model not in VISION_MODEL_MAP:
+        return
+    import torch
+    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+
+    model_id = VISION_MODEL_MAP[model]
+    model_dir = VISION_CACHE_DIR / ("models--" + model_id.replace("/", "--"))
+    if not model_dir.exists() or not any(model_dir.glob("snapshots/*")):
+        logger.warning(f"视觉模型未下载: {model}，跳过自动加载")
+        return
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    device_map = "auto"
+    logger.info(f"正在加载视觉模型: {model} ({model_id}) ...")
+    VISION_MODEL_INSTANCE = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_id, cache_dir=str(VISION_CACHE_DIR), device_map=device_map,
+        torch_dtype=torch.bfloat16, quantization_config=bnb_config
+    )
+    VISION_PROCESSOR_INSTANCE = AutoProcessor.from_pretrained(model_id, cache_dir=str(VISION_CACHE_DIR))
+    VISION_CURRENT_MODEL = model
+    logger.info(f"视觉模型 {model} 已自动加载完成")
+
+
 @app.get("/api/vision-model/status")
 def vision_model_status(model: str):
     """检查本地视觉模型是否已下载和已加载"""
@@ -1330,6 +1379,28 @@ async def vision_model_load(request: Request):
         return {"status": "ok", "message": f"模型 {model} 已加载"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/vision-model/unload")
+async def vision_model_unload():
+    """卸载本地视觉模型，释放 GPU 显存"""
+    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
+    import gc
+    import torch
+    
+    if VISION_MODEL_INSTANCE is not None:
+        del VISION_MODEL_INSTANCE
+        VISION_MODEL_INSTANCE = None
+    if VISION_PROCESSOR_INSTANCE is not None:
+        del VISION_PROCESSOR_INSTANCE
+        VISION_PROCESSOR_INSTANCE = None
+    VISION_CURRENT_MODEL = None
+    
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return {"status": "ok", "message": "模型已卸载，显存已释放"}
 
 
 @app.post("/api/vision-model/recognize")

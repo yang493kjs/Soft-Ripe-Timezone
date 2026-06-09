@@ -850,6 +850,37 @@ def update_persona_template(persona_id: str, req: PersonaTemplateUpdateReq, admi
 
 
 # ============================================================
+# 14. 视觉模型配置（管理员集中管理）
+# ============================================================
+class VisionModelConfigReq(BaseModel):
+    model: str  # 空字符串表示不使用，如 "qwen3vl2b", "qwen3vl4b", "qwen3vl7b"
+
+VISION_MODEL_OPTIONS = ["qwen3vl2b", "qwen3vl4b", "qwen3vl7b"]
+
+
+@admin_router.get("/vision-model/config")
+def get_vision_model_config(admin_user: str = Query(None)):
+    """获取当前视觉模型配置"""
+    _verify_admin(admin_user)
+    from main import load_config
+    cfg = load_config()
+    return {"model": cfg.get("vision_model", "")}
+
+
+@admin_router.post("/vision-model/config")
+def set_vision_model_config(req: VisionModelConfigReq, admin_user: str = Query(None)):
+    """设置视觉模型配置（全局生效）"""
+    _verify_admin(admin_user)
+    if req.model and req.model not in VISION_MODEL_OPTIONS:
+        raise HTTPException(status_code=400, detail=f"不支持的模型: {req.model}，可选: {', '.join(VISION_MODEL_OPTIONS)}")
+    from main import load_config, save_config
+    cfg = load_config()
+    cfg["vision_model"] = req.model
+    save_config(cfg)
+    return {"status": "ok", "model": req.model}
+
+
+# ============================================================
 # 14. 上传角色头像
 # ============================================================
 AVATAR_DIR = os.path.join(os.path.dirname(__file__), "static", "avatars")

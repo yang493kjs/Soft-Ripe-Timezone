@@ -103,6 +103,9 @@
           <span class="topbar-brand">⚙️ 管理员仪表盘</span>
         </div>
         <div class="topbar-right">
+          <button class="tb-btn" @click="showAdminVisionPanel = true" title="本地视觉模型">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </button>
           <button class="tb-btn" @click="showAdminPasswordPanel = true" title="修改密码">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
           </button>
@@ -753,52 +756,6 @@
                 <p class="config-msg" v-if="configMsg">{{ configMsg }}</p>
               </div>
             </div>
-            <div class="panel-block">
-              <h4>本地视觉理解模型</h4>
-              <p style="font-size:0.75rem;color:#888;margin:0 0 10px 0;">当 API 模型不支持图片理解时，自动调用本地视觉模型</p>
-              <div class="vision-model-select">
-                <label class="vision-model-label">选择模型</label>
-                <select class="config-input" v-model="localVisionModel" style="margin-bottom:8px;">
-                  <option value="">不使用本地模型</option>
-                  <option value="qwen3vl2b">Qwen3-VL-2B (推荐 · 轻量快速)</option>
-                  <option value="qwen3vl4b">Qwen3-VL-4B (平衡 · 精度更高)</option>
-                  <option value="qwen3vl7b">Qwen3-VL-7B (高精度 · 需更多显存)</option>
-                </select>
-              </div>
-              <div class="vision-model-status" v-if="localVisionModel">
-                <div class="vision-status-row">
-                  <span class="vision-status-icon" :class="{ loaded: visionModelLoaded, ready: visionModelReady && !visionModelLoaded, downloading: visionModelDownloading, loading: visionModelLoading }">
-                    {{ visionModelLoading ? '⏳' : (visionModelDownloading ? '⏳' : (visionModelLoaded ? '✓' : (visionModelReady ? '○' : '✗'))) }}
-                  </span>
-                  <span class="vision-status-text">
-                    {{ visionModelStatusText }}
-                  </span>
-                </div>
-                <button
-                  v-if="!visionModelReady && !visionModelDownloading && !visionModelLoading"
-                  class="config-btn"
-                  @click="downloadVisionModel"
-                  style="margin-top:8px;"
-                >
-                  下载模型
-                </button>
-                <button
-                  v-if="visionModelReady && !visionModelLoaded && !visionModelLoading && !visionModelDownloading"
-                  class="config-btn"
-                  @click="loadVisionModel"
-                  style="margin-top:8px;"
-                >
-                  加载模型
-                </button>
-                <div class="vision-download-progress" v-if="visionModelDownloading || visionModelLoading">
-                  <div class="progress-bar">
-                    <div class="progress-fill" :style="{ width: visionModelDownloading ? visionDownloadProgress + '%' : '100%' }"></div>
-                  </div>
-                  <span class="progress-text">{{ visionModelDownloading ? (visionDownloadProgress + '%') : '加载中...' }}</span>
-                </div>
-              </div>
-              <p class="config-msg" v-if="visionModelMsg">{{ visionModelMsg }}</p>
-            </div>
           </div>
 
           <!-- 界面样式子菜单 -->
@@ -885,6 +842,57 @@
           {{ forgotLoading ? '重置中…' : '重置密码' }}
         </button>
         <p class="config-msg" v-if="forgotMsg" :style="{ color: forgotMsg.includes('成功') ? '#4caf7e' : '' }">{{ forgotMsg }}</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 管理员视觉模型面板 -->
+  <div class="overlay overlay-center" v-if="showAdminVisionPanel" @click.self="showAdminVisionPanel = false">
+    <div class="panel" style="max-width:480px;">
+      <div class="panel-head">
+        <h3>🎨 本地视觉模型</h3>
+        <button class="panel-close-btn" @click="showAdminVisionPanel = false">✕</button>
+      </div>
+      <div class="panel-block">
+        <p style="font-size:0.75rem;color:#888;margin:0 0 12px 0;">集中管理：当 API 模型不支持图片理解时，所有用户统一使用此本地视觉模型</p>
+        <div class="config-row" style="margin-bottom:12px;">
+          <label style="font-size:12px;opacity:.6;margin-bottom:4px;display:block;">选择模型</label>
+          <select class="config-input" v-model="adminVisionModel" style="width:100%;" @change="adminSaveVisionModelConfig">
+            <option value="">不使用本地模型</option>
+            <option value="qwen3vl2b">Qwen3-VL-2B (推荐 · 轻量快速)</option>
+            <option value="qwen3vl4b">Qwen3-VL-4B (平衡 · 精度更高)</option>
+            <option value="qwen3vl7b">Qwen3-VL-7B (高精度 · 需更多显存)</option>
+          </select>
+        </div>
+        <div v-if="adminVisionModel" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:8px;font-size:.8rem;margin-bottom:8px;">
+            <span class="vision-status-icon" :class="{ loaded: adminVisionLoaded, ready: adminVisionReady && !adminVisionLoaded, downloading: adminVisionDownloading, loading: adminVisionLoading }">
+              {{ adminVisionLoading ? '⏳' : (adminVisionDownloading ? '⏳' : (adminVisionLoaded ? '✓' : (adminVisionReady ? '○' : '✗'))) }}
+            </span>
+            <span>{{ adminVisionStatusText }}</span>
+          </div>
+          <div class="vision-download-progress" v-if="adminVisionDownloading || adminVisionLoading" style="margin-bottom:8px;">
+            <div class="progress-bar"><div class="progress-fill" :style="{ width: adminVisionDownloading ? adminVisionDownloadProgress + '%' : '100%' }"></div></div>
+            <span class="progress-text">{{ adminVisionDownloading ? (adminVisionDownloadProgress + '%') : '加载中...' }}</span>
+          </div>
+          <button
+            v-if="!adminVisionReady && !adminVisionDownloading && !adminVisionLoading"
+            class="config-btn"
+            @click="adminDownloadVisionModel"
+            style="width:100%;"
+          >
+            下载模型
+          </button>
+          <button
+            v-if="adminVisionReady && !adminVisionLoaded && !adminVisionLoading && !adminVisionDownloading"
+            class="config-btn"
+            @click="adminLoadVisionModel"
+            style="width:100%;"
+          >
+            加载模型
+          </button>
+        </div>
+        <p class="config-msg" v-if="adminVisionMsg">{{ adminVisionMsg }}</p>
       </div>
     </div>
   </div>
@@ -1088,6 +1096,7 @@ const doLogin = async () => {
       if (d.username === 'admin888') {
         showPersonaPicker.value = false
         await adminLoadUsers()
+        adminLoadVisionModelConfig()
       } else {
         const lastPersona = localStorage.getItem('sr_last_persona')
         if (lastPersona && personas.value.some(p => p.id === lastPersona)) {
@@ -1182,10 +1191,6 @@ const doLogout = () => {
   layoutMode.value = 'default'
   setLayoutMode('default')
   theme.value = 'dark'
-  localVisionModel.value = ''
-  visionModelReady.value = false
-  visionModelLoaded.value = false
-  visionModelStatusText.value = ''
   messages.value = []
   hasMoreMessages.value = false
   memuStatus.value = null
@@ -1301,16 +1306,6 @@ const configModel = ref('')
 const configMsg = ref('')
 const configLoading = ref(false)
 
-// 本地视觉模型
-const localVisionModel = ref('')
-const visionModelReady = ref(false)
-const visionModelLoaded = ref(false)
-const visionModelLoading = ref(false)
-const visionModelDownloading = ref(false)
-const visionDownloadProgress = ref(0)
-const visionModelMsg = ref('')
-const visionModelStatusText = ref('')
-
 // 外观设置
 const fontSize = ref('medium')
 const layoutMode = ref('default')
@@ -1336,8 +1331,19 @@ const adminSelectedKey = ref(null)
 const adminSelectedPersonaId = ref(null)
 const adminSelectedAgents = ref([])
 
+// 管理员视觉模型管理
+const adminVisionModel = ref('')
+const adminVisionReady = ref(false)
+const adminVisionLoaded = ref(false)
+const adminVisionLoading = ref(false)
+const adminVisionDownloading = ref(false)
+const adminVisionDownloadProgress = ref(0)
+const adminVisionMsg = ref('')
+const adminVisionStatusText = ref('')
+
 // 管理员修改密码
 const showAdminPasswordPanel = ref(false)
+const showAdminVisionPanel = ref(false)
 const adminOldPassword = ref('')
 const adminNewPassword = ref('')
 const adminNewPasswordConfirm = ref('')
@@ -1465,49 +1471,83 @@ const loadUserSettings = () => {
   if (savedTheme) {
     theme.value = savedTheme
   }
-  const savedVisionModel = localStorage.getItem(userStorageKey('vision_model'))
-  if (savedVisionModel) {
-    localVisionModel.value = savedVisionModel
+}
+
+// 管理员视觉模型管理函数（替换原来的用户级视觉模型逻辑）
+const adminLoadVisionModelConfig = async () => {
+  try {
+    const resp = await apiFetch(`${API}/api/admin/vision-model/config?admin_user=admin888`)
+    const data = await resp.json()
+    adminVisionModel.value = data.model || ''
+    if (adminVisionModel.value) {
+      adminCheckVisionModelStatus()
+    }
+  } catch (e) {
+    console.error('[AdminVision] 加载配置失败:', e)
   }
 }
 
-const checkVisionModelStatus = async () => {
-  if (!localVisionModel.value) {
-    visionModelReady.value = false
-    visionModelLoaded.value = false
-    visionModelStatusText.value = '未选择模型'
+const adminSaveVisionModelConfig = async () => {
+  // 切换模型时先卸载已加载的模型
+  try {
+    await apiFetch(`${API}/api/vision-model/unload`, { method: 'POST' })
+  } catch (e) { /* 忽略 */ }
+  adminVisionReady.value = false
+  adminVisionLoaded.value = false
+  adminVisionStatusText.value = ''
+
+  try {
+    await apiFetch(`${API}/api/admin/vision-model/config?admin_user=admin888`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: adminVisionModel.value })
+    })
+    adminVisionMsg.value = adminVisionModel.value ? '配置已保存' : '已关闭本地视觉模型'
+    if (adminVisionModel.value) {
+      adminCheckVisionModelStatus()
+    }
+  } catch (e) {
+    adminVisionMsg.value = `保存失败: ${e.message}`
+  }
+}
+
+const adminCheckVisionModelStatus = async () => {
+  if (!adminVisionModel.value) {
+    adminVisionReady.value = false
+    adminVisionLoaded.value = false
+    adminVisionStatusText.value = '未选择模型'
     return
   }
   try {
-    const resp = await apiFetch(`${API}/api/vision-model/status?model=${localVisionModel.value}`)
+    const resp = await apiFetch(`${API}/api/vision-model/status?model=${adminVisionModel.value}`)
     const data = await resp.json()
-    visionModelReady.value = data.downloaded || false
-    visionModelLoaded.value = data.loaded || false
+    adminVisionReady.value = data.downloaded || false
+    adminVisionLoaded.value = data.loaded || false
     if (data.loaded) {
-      visionModelStatusText.value = '模型已加载 · 可用于图片识别'
+      adminVisionStatusText.value = '模型已加载 · 可用于图片识别'
     } else if (data.downloaded) {
-      visionModelStatusText.value = '模型已下载 · 点击加载'
+      adminVisionStatusText.value = '模型已下载 · 点击加载'
     } else {
-      visionModelStatusText.value = '模型未下载'
+      adminVisionStatusText.value = '模型未下载'
     }
   } catch (e) {
-    console.error('[VisionModel] 状态检测失败:', e)
-    visionModelReady.value = false
-    visionModelLoaded.value = false
-    visionModelStatusText.value = '无法检测模型状态（请确认后端服务已启动）'
+    console.error('[AdminVision] 状态检测失败:', e)
+    adminVisionReady.value = false
+    adminVisionLoaded.value = false
+    adminVisionStatusText.value = '无法检测模型状态（请确认后端服务已启动）'
   }
 }
 
-const downloadVisionModel = async () => {
-  if (!localVisionModel.value || visionModelDownloading.value) return
-  visionModelDownloading.value = true
-  visionDownloadProgress.value = 0
-  visionModelMsg.value = ''
+const adminDownloadVisionModel = async () => {
+  if (!adminVisionModel.value || adminVisionDownloading.value) return
+  adminVisionDownloading.value = true
+  adminVisionDownloadProgress.value = 0
+  adminVisionMsg.value = ''
   try {
     const resp = await apiFetch(`${API}/api/vision-model/download`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: localVisionModel.value })
+      body: JSON.stringify({ model: adminVisionModel.value })
     })
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}))
@@ -1527,15 +1567,14 @@ const downloadVisionModel = async () => {
           try {
             const data = JSON.parse(line.slice(6))
             if (data.progress !== undefined) {
-              visionDownloadProgress.value = Math.round(data.progress)
+              adminVisionDownloadProgress.value = Math.round(data.progress)
             }
             if (data.status === 'complete') {
-              visionModelReady.value = true
-              visionModelDownloading.value = false
-              visionModelStatusText.value = '模型已下载 · 正在加载...'
-              visionModelMsg.value = '模型下载完成！正在加载到内存...'
-              // 自动加载模型
-              loadVisionModel()
+              adminVisionReady.value = true
+              adminVisionDownloading.value = false
+              adminVisionStatusText.value = '模型已下载 · 正在加载...'
+              adminVisionMsg.value = '模型下载完成！正在加载到内存...'
+              adminLoadVisionModel()
             }
             if (data.status === 'error') {
               throw new Error(data.message || '下载出错')
@@ -1547,47 +1586,35 @@ const downloadVisionModel = async () => {
       }
     }
   } catch (e) {
-    visionModelMsg.value = `下载失败: ${e.message}`
-    visionModelDownloading.value = false
+    adminVisionMsg.value = `下载失败: ${e.message}`
+    adminVisionDownloading.value = false
   }
 }
 
-const loadVisionModel = async () => {
-  if (!localVisionModel.value || visionModelLoading.value) return
-  visionModelLoading.value = true
-  visionModelMsg.value = ''
+const adminLoadVisionModel = async () => {
+  if (!adminVisionModel.value || adminVisionLoading.value) return
+  adminVisionLoading.value = true
+  adminVisionMsg.value = ''
   try {
     const resp = await apiFetch(`${API}/api/vision-model/load`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: localVisionModel.value })
+      body: JSON.stringify({ model: adminVisionModel.value })
     })
     const data = await resp.json()
     if (data.status === 'ok') {
-      visionModelLoaded.value = true
-      visionModelStatusText.value = '模型已加载 · 可用于图片识别'
-      visionModelMsg.value = '模型加载成功！'
+      adminVisionLoaded.value = true
+      adminVisionStatusText.value = '模型已加载 · 可用于图片识别'
+      adminVisionMsg.value = '模型加载成功！'
     } else {
       throw new Error(data.message || '加载失败')
     }
   } catch (e) {
-    visionModelMsg.value = `加载失败: ${e.message}`
-    visionModelLoaded.value = false
+    adminVisionMsg.value = `加载失败: ${e.message}`
+    adminVisionLoaded.value = false
   }
-  visionModelLoading.value = false
+  adminVisionLoading.value = false
 }
-
-// 监听本地视觉模型选择变化
-watch(localVisionModel, () => {
-  if (localVisionModel.value) {
-    checkVisionModelStatus()
-  } else {
-    visionModelReady.value = false
-    visionModelLoaded.value = false
-    visionModelStatusText.value = ''
-  }
-  localStorage.setItem(userStorageKey('vision_model'), localVisionModel.value)
-})
 
 // 监听主题变化，持久化到用户专属存储
 watch(theme, (val) => {
@@ -2364,6 +2391,14 @@ const startChatWithPersona = async (personaId) => {
 const handleImageUpload = (e) => {
   const file = e.target.files[0]
   if (!file) return
+
+  // 限制只能上传图片
+  if (!file.type.startsWith('image/')) {
+    alert('只能上传图片文件（支持 JPG、PNG、GIF、WebP 等格式）')
+    e.target.value = ''
+    return
+  }
+
   imageMimeType.value = file.type
   const reader = new FileReader()
   reader.onload = () => {
@@ -2491,9 +2526,11 @@ const doSend = async (combinedText, imageData = null) => {
     // Task 4: 分段渲染
     // ============================================================
     if (d.segments && d.segments.length > 0) {
+      // 空消息兜底：若 AI 返回空内容，替换为默认提示
+      const firstContent = (d.segments[0] && d.segments[0].trim()) ? d.segments[0] : '（AI 暂时无法回应，请稍后再试）'
       const aiMsg = {
         _id: Date.now(),
-        content: d.segments[0],
+        content: firstContent,
         senderId: 'ai',
         timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
         busy: d.ai_message?.busy || false,
@@ -2540,6 +2577,9 @@ const doSend = async (combinedText, imageData = null) => {
       }
     } else if (d.ai_message) {
       // 兼容旧版响应（无 segments 字段）
+      if (!d.ai_message.content || !d.ai_message.content.trim()) {
+        d.ai_message.content = '（AI 暂时无法回应，请稍后再试）'
+      }
       messages.value.push(d.ai_message)
     }
 
@@ -2691,6 +2731,7 @@ onMounted(async () => {
     if (session.username === 'admin888') {
       showPersonaPicker.value = false
       await adminLoadUsers()
+      adminLoadVisionModelConfig()
     } else if (session.persona && personas.value.some(p => p.id === session.persona)) {
       selectedPersona.value = session.persona
       showPersonaPicker.value = false
@@ -3001,6 +3042,9 @@ body { font-family: var(--font); -webkit-font-smoothing: antialiased }
 .dark .panel-head { border-bottom: 1px solid rgba(255,255,255,.05) }
 .light .panel-head { border-bottom: 1px solid rgba(0,0,0,.06) }
 .panel-head h3 { font-size: 1rem; font-weight: 600 }
+.panel-close-btn { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; background: transparent; color: inherit; transition: background .2s; }
+.dark .panel-close-btn:hover { background: rgba(255,255,255,.08); }
+.light .panel-close-btn:hover { background: rgba(0,0,0,.06); }
 
 .x-btn { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 50%; cursor: pointer; background: transparent; transition: all .2s var(--ease) }
 .dark .x-btn { color: var(--night-muted) }
@@ -3559,6 +3603,17 @@ body { font-family: var(--font); -webkit-font-smoothing: antialiased }
 .dark .topbar-brand { color: var(--night-accent); }
 .light .topbar-brand { color: var(--warm-accent); }
 .admin-layout { display: flex; flex: 1; overflow: hidden; }
+
+/* 视觉模型状态图标（模态面板内使用） */
+.vision-status-icon { font-size: 1rem; }
+.vision-status-icon.loaded { color: #4ade80; }
+.vision-status-icon.ready { color: #fbbf24; }
+.vision-status-icon.downloading,
+.vision-status-icon.loading { color: #60a5fa; }
+.vision-download-progress { margin-top: 0; }
+.vision-download-progress .progress-bar { height: 6px; background: rgba(255,255,255,.1); border-radius: 3px; overflow: hidden; }
+.vision-download-progress .progress-fill { height: 100%; background: var(--warm-accent); border-radius: 3px; transition: width .3s; }
+.vision-download-progress .progress-text { font-size: .7rem; color: #888; display: block; margin-top: 4px; }
 
 .admin-sidebar {
   width: 220px; flex-shrink: 0; overflow-y: auto; padding: 16px;

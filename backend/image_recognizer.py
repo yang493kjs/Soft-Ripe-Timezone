@@ -6,8 +6,10 @@
 """
 
 import base64
+from io import BytesIO
 from typing import Optional
 
+from PIL import Image
 from openai import OpenAI
 
 from settings import logger, client, current_model
@@ -56,6 +58,23 @@ def _has_local_vision() -> bool:
         return False
 
 
+def _convert_to_jpeg_b64(image_base64: str, mime_type: str) -> Optional[str]:
+    """将非 JPEG 格式图片转为 JPEG base64（WebP/PNG 等 → JPEG）"""
+    try:
+        if mime_type == "image/jpeg":
+            return image_base64  # 已经是 JPEG，无需转换
+        image_bytes = base64.b64decode(image_base64)
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        jpeg_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        logger.info(f"[图片识别] {mime_type} → JPEG 转换成功 (原 {len(image_base64)} → {len(jpeg_b64)} 字符)")
+        return jpeg_b64
+    except Exception as e:
+        logger.warning(f"[图片识别] {mime_type} → JPEG 转换失败: {e}")
+        return None
+
+
 def recognize_image_base64(image_base64: str, mime_type: str = "image/png") -> dict:
     """
     使用视觉模型识别图片内容。
@@ -67,34 +86,54 @@ def recognize_image_base64(image_base64: str, mime_type: str = "image/png") -> d
     Returns:
         {
             "success": bool,
-            "text": str,           # 识别结果文本（识别成功时）
-            "human_hint": str,     # 给 AI 的提示（识别失败时，告诉 AI 如何回应）
-            "vision_supported": bool,  # 模型是否支持视觉
+            "text": str,
+            "human_hint": str,
+            "vision_supported": bool,
+            "failure_reason": str,  # 新增：失败原因详情
         }
     """
-    result = {"success": False, "text": "", "human_hint": "", "vision_supported": False}
+    result = {
+        "success": False,
+        "text": "",
+        "human_hint": "",
+        "vision_supported": False,
+        "failure_reason": "",
+    }
+
+    # 0. 检测图片格式，WebP 等格式自动转 JPEG（部分 API 不兼容）
+    vision_b64 = image_base64
+    vision_mime = mime_type
+    if mime_type not in ("image/jpeg", "image/jpg", "image/png"):
+        converted = _convert_to_jpeg_b64(image_base64, mime_type)
+        if converted:
+            vision_b64 = converted
+            vision_mime = "image/jpeg"
+        else:
+            logger.warning(f"[图片识别] 格式 {mime_type} 转换失败，仍将尝试原始格式")
 
     # 1. 检查 client
     cl = _get_vision_client()
     if cl is None:
-        # 没有 API 客户端，尝试本地视觉模型
+        result["failure_reason"] = "未配置 API 客户端（API Key 未设置）"
+        logger.info(f"[图片识别] {result['failure_reason']}，尝试本地视觉模型")
         local_result = _try_local_vision(image_base64, mime_type)
         if local_result:
             return local_result
+        result["failure_reason"] += "；本地视觉模型也未加载"
         result["human_hint"] = VISION_UNAVAILABLE_HINT
         return result
 
     # 2. 快速预检
     if not _check_vision_support():
-        logger.info(f"[图片识别] 当前模型 {current_model} 可能不支持视觉，跳过识别")
-        # 尝试本地视觉模型
+        result["failure_reason"] = f"当前模型 {current_model} 不在视觉模型关键词列表中，且本地视觉模型未加载"
+        logger.info(f"[图片识别] {result['failure_reason']}")
         local_result = _try_local_vision(image_base64, mime_type)
         if local_result:
             return local_result
         result["human_hint"] = VISION_UNAVAILABLE_HINT
         return result
 
-    # 3. 尝试调用视觉 API
+    # 3. 调用视觉 API
     model = IMAGE_VISION_MODEL or current_model
 
     prompt = (
@@ -105,13 +144,13 @@ def recognize_image_base64(image_base64: str, mime_type: str = "image/png") -> d
     )
 
     try:
-        logger.info(f"[图片识别] 使用模型 {model} 开始识别")
+        logger.info(f"[图片识别] 使用模型 {model} 识别 (格式: {vision_mime})")
         resp = cl.chat.completions.create(
             model=model,
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:{vision_mime};base64,{vision_b64}"}},
                     {"type": "text", "text": prompt},
                 ]
             }],
@@ -122,32 +161,37 @@ def recognize_image_base64(image_base64: str, mime_type: str = "image/png") -> d
         if text:
             result["success"] = True
             result["vision_supported"] = True
-            result["text"] = f"[用户发送了图片，内容：{text}]"
+            result["text"] = f"[系统提示] 你刚刚识别了用户发送的图片，你看到了：{text}"
             logger.info(f"[图片识别] 成功: {text[:80]}...")
+            return result
         else:
-            result["human_hint"] = VISION_UNAVAILABLE_HINT
-            logger.warning("[图片识别] 返回空内容")
+            result["failure_reason"] = f"视觉 API ({model}) 返回了空内容"
+            logger.warning(f"[图片识别] {result['failure_reason']}")
 
     except Exception as e:
-        err_msg = str(e).lower()
+        err_msg = str(e)
+        err_msg_lower = err_msg.lower()
         # 判断是否是不支持 vision 导致的错误
-        if any(kw in err_msg for kw in [
+        if any(kw in err_msg_lower for kw in [
             "invalid content type", "image_url not supported",
             "does not support", "unsupported", "not supported",
             "invalid_request", "bad request", "input should be",
             "content must be a string", "content_parts",
         ]):
-            logger.info(f"[图片识别] 模型不支持视觉: {str(e)[:120]}")
-            result["human_hint"] = VISION_UNAVAILABLE_HINT
+            result["failure_reason"] = f"视觉 API 不支持 ({model}): {err_msg[:150]}"
+            logger.info(f"[图片识别] {result['failure_reason']}")
         else:
-            logger.error(f"[图片识别] 未知错误: {e}", exc_info=True)
-            result["human_hint"] = VISION_UNAVAILABLE_HINT
+            result["failure_reason"] = f"视觉 API 调用异常 ({model}): {err_msg[:150]}"
+            logger.error(f"[图片识别] {result['failure_reason']}")
 
-    # 4. 如果 API 模型不支持视觉，尝试使用本地视觉模型
-    if not result["success"] and result["human_hint"]:
+    # 4. API 失败时，尝试本地视觉模型
+    if not result["success"]:
+        logger.info(f"[图片识别] API 失败 ({result['failure_reason'][:80]})，尝试本地视觉模型")
         local_result = _try_local_vision(image_base64, mime_type)
         if local_result:
             return local_result
+        result["failure_reason"] += "；本地视觉模型也未成功"
+        result["human_hint"] = VISION_UNAVAILABLE_HINT
 
     return result
 
@@ -163,13 +207,12 @@ def _try_local_vision(image_base64: str, mime_type: str = "image/png") -> Option
             return None
         
         import torch
-        from PIL import Image
-        from io import BytesIO
         from qwen_vl_utils import process_vision_info
         
         # 解码图片
         image_bytes = base64.b64decode(image_base64)
         pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        logger.info(f"[图片识别] 本地模型解码图片: format={mime_type}, size={pil_image.size}")
         
         # 缩放
         max_size = 768
@@ -226,14 +269,18 @@ def _try_local_vision(image_base64: str, mime_type: str = "image/png") -> Option
             logger.info(f"[图片识别] 本地视觉模型({VISION_CURRENT_MODEL})成功: {text[:80]}...")
             return {
                 "success": True,
-                "text": f"[用户发送了图片，内容：{text}]",
+                "text": f"[系统提示] 你刚刚识别了用户发送的图片，你看到了：{text}",
                 "human_hint": "",
                 "vision_supported": True,
+                "failure_reason": "",
             }
-    except ImportError:
-        logger.info("[图片识别] 本地视觉模型依赖未安装")
+        else:
+            logger.warning(f"[图片识别] 本地视觉模型({VISION_CURRENT_MODEL})返回空内容")
+            return None
+    except ImportError as e:
+        logger.info(f"[图片识别] 本地视觉模型依赖未安装: {e}")
     except Exception as e:
-        logger.warning(f"[图片识别] 本地视觉模型调用失败: {e}")
+        logger.warning(f"[图片识别] 本地视觉模型调用失败 ({type(e).__name__}): {e}")
     
     return None
 
@@ -259,4 +306,4 @@ def recognize_image_file(file_path: str) -> dict:
 
     except Exception as e:
         logger.error(f"[图片识别] 读取文件失败: {e}")
-        return {"success": False, "text": "", "human_hint": VISION_UNAVAILABLE_HINT, "vision_supported": False}
+        return {"success": False, "text": "", "human_hint": VISION_UNAVAILABLE_HINT, "vision_supported": False, "failure_reason": f"读取文件失败: {e}"}
