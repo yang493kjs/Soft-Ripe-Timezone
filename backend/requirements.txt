@@ -6,3 +6,15 @@ pydantic==2.13.4
 beautifulsoup4>=4.12
 lxml>=5.1
 requests>=2.31
+
+# 图片处理
+Pillow>=10.0
+
+# 本地 Embedding 模型（记忆系统）
+sentence-transformers>=3.0
+
+# 本地视觉模型（图片识别）
+torch>=2.1
+transformers>=4.44
+huggingface-hub>=0.24
+bitsandbytes>=0.43
