@@ -5,9 +5,12 @@ SQLite 数据库模块 — 替代 messages.json / agents.json / monologues.json
 import os
 import sqlite3
 import json
+import logging
 import threading
 from datetime import datetime
 from typing import Optional, List, Dict
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "app.db")
 
@@ -64,6 +67,43 @@ def init_db():
     """)
     conn.commit()
 
+    # 迁移：添加外键约束（如果不存在）
+    fk_list = conn.execute("PRAGMA foreign_key_list('messages')").fetchall()
+    if not fk_list:
+        logger.info("正在为 messages 表添加外键约束...")
+        # 先清理孤立消息
+        orphaned = conn.execute("""
+            SELECT COUNT(*) FROM messages
+            WHERE agent_id NOT IN (SELECT agent_id FROM agents)
+        """).fetchone()[0]
+        if orphaned > 0:
+            logger.info(f"清理 {orphaned} 条孤立消息（无对应 agent）")
+            conn.execute("""
+                DELETE FROM messages
+                WHERE agent_id NOT IN (SELECT agent_id FROM agents)
+            """)
+        # 迁移表结构
+        conn.executescript("""
+            CREATE TABLE messages_new (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sender_id TEXT NOT NULL CHECK(sender_id IN ('user', 'ai')),
+                timestamp TEXT NOT NULL,
+                date TEXT NOT NULL DEFAULT '',
+                status TEXT DEFAULT 'read',
+                extra TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+            );
+            INSERT INTO messages_new SELECT * FROM messages;
+            DROP TABLE messages;
+            ALTER TABLE messages_new RENAME TO messages;
+            CREATE INDEX IF NOT EXISTS idx_messages_agent_time ON messages(agent_id, created_at);
+        """)
+        conn.commit()
+        logger.info("外键约束添加完成")
+
 
 # ===================== Messages =====================
 
@@ -92,7 +132,7 @@ def load_messages(agent_id: str) -> list:
 
 
 def load_messages_paginated(agent_id: str, limit: int = 50, before_id: str = None) -> list:
-    """分页加载消息，返回前端兼容格式"""
+    """分页加载消息，默认返回最新 limit 条（ASC 顺序），before_id 时加载更早的消息"""
     conn = get_conn()
     if before_id:
         rows = conn.execute(
@@ -102,8 +142,11 @@ def load_messages_paginated(agent_id: str, limit: int = 50, before_id: str = Non
             (agent_id, before_id, limit)
         ).fetchall()
     else:
+        # 返回最新的 limit 条消息，按时间正序
         rows = conn.execute(
-            "SELECT * FROM messages WHERE agent_id=? ORDER BY created_at ASC LIMIT ?",
+            """SELECT * FROM (
+                SELECT * FROM messages WHERE agent_id=? ORDER BY created_at DESC LIMIT ?
+            ) ORDER BY created_at ASC""",
             (agent_id, limit)
         ).fetchall()
     result = []
@@ -194,13 +237,13 @@ def load_agents() -> dict:
 
 
 def save_agent(agent: dict):
-    """插入或更新 agent"""
+    """插入或更新 agent，处理 agent_id 和 (user_id, persona_id) 冲突"""
     conn = get_conn()
     conn.execute(
         """INSERT INTO agents (agent_id, user_id, persona_id, persona_name, system_prompt,
            phase, intimacy, passion, commitment, relationship_days, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(agent_id) DO UPDATE SET
+           ON CONFLICT(user_id, persona_id) DO UPDATE SET
            persona_name=excluded.persona_name,
            system_prompt=excluded.system_prompt,
            phase=excluded.phase,

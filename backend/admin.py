@@ -880,6 +880,21 @@ def set_vision_model_config(req: VisionModelConfigReq, admin_user: str = Query(N
     return {"status": "ok", "model": req.model}
 
 
+class VisionBackendReq(BaseModel):
+    backend: str = "transformers"  # transformers + 动态 GPU/CPU 切换
+
+
+@admin_router.get("/vision-model/backend")
+def get_vision_backend(admin_user: str = Query(None)):
+    """获取视觉模型后端信息"""
+    _verify_admin(admin_user)
+    return {
+        "backend": "CPU 内存常驻 + 推理时瞬移 GPU",
+        "description": "模型加载到 16GB 内存条（零显存），推理时 model.to(cuda) 移到 GPU，完成后 model.to(cpu) 移回内存",
+        "note": "不再使用 llama.cpp，回退到 transformers + bitsandbytes 4bit 量化",
+    }
+
+
 # ============================================================
 # 14. 上传角色头像
 # ============================================================

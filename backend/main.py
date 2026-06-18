@@ -187,10 +187,15 @@ def get_or_create_agent(user_id: str, persona_id: str) -> dict:
             "commitment": 5
         }
         save_agent(agent)
-        emo = get_emotion(agent_id)
+        # 重新从数据库加载，确保获取正确的 agent_id（处理 (user_id, persona_id) 冲突）
+        agents = load_agents()
+        if key in agents:
+            agent = agents[key]
+        else:
+            agents[key] = agent
+        emo = get_emotion(agent["agent_id"])
         emo.relationship["days"] = 1
         emo.save()
-        agents[key] = agent
     else:
         existing_msgs = get_last_n_messages(agents[key]["agent_id"], 20)
         if existing_msgs and agents[key]["agent_id"] not in RECALL_BUFFER:
@@ -216,7 +221,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(_get_local_embed_model)
     logger.info("Embedding 模型已预加载完成")
 
-    # 自动加载管理员配置的视觉模型
+    # 视觉模型自动加载（带进度条）
     cfg = load_config()
     vision_model = cfg.get("vision_model", "")
     if vision_model:
@@ -246,12 +251,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("未配置 OPENAI_API_KEY，AI 回复将不可用")
 
-    # 服务器完全就绪后自动打开浏览器
-    webbrowser.open("http://localhost:8765")
+    # 自动打开浏览器
+    await asyncio.to_thread(webbrowser.open, "http://localhost:8765")
     logger.info("浏览器已自动打开")
 
-    yield
-    logger.info("半熟时区 后端服务已停止")
+    try:
+        yield
+    except asyncio.CancelledError:
+        # 优雅处理服务器关闭时的 asyncio 取消异常
+        pass
+    finally:
+        logger.info("半熟时区 后端服务已停止")
 
 
 app = FastAPI(title="半熟时区 API - MemU 记忆系统", lifespan=lifespan)
@@ -1198,122 +1208,253 @@ def config_status():
     }
 
 
-# ==================== 本地视觉模型 API ====================
+# ==================== 本地视觉模型 API（CPU 内存常驻，推理时移到 GPU，完成后回内存） ====================
 
 import threading
 from pathlib import Path
+import time as _time_module
+import gc as _gc_module
 
+# 模型映射：模型名 → HuggingFace model_id
 VISION_MODEL_MAP = {
     "qwen3vl2b": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3vl4b": "Qwen/Qwen3-VL-4B-Instruct",
-    "qwen3vl7b": "Qwen/Qwen3-VL-7B-Instruct",
+    "qwen3vl8b": "Qwen/Qwen3-VL-8B-Instruct",
 }
 
-VISION_CACHE_DIR = Path(os.path.expanduser("~/.cache/huggingface/hub"))
-VISION_DOWNLOAD_STATUS = {}
-VISION_MODEL_LOADED = {}
-VISION_MODEL_INSTANCE = None
-VISION_PROCESSOR_INSTANCE = None
-VISION_CURRENT_MODEL = None
+VISION_MODEL_INSTANCE = None       # 模型 + processor 元组
+VISION_CURRENT_MODEL = None        # 当前加载的模型名
+VISION_LOAD_STATS = {}             # 加载耗时/内存统计
+VISION_INFER_STATS = {}            # 推理耗时/速度统计
+
+
+def _get_memory_info():
+    """获取系统内存 + 显存使用情况"""
+    info = {"system_ram": {}, "gpu_vram": {}}
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        info["system_ram"] = {
+            "total_gb": round(mem.total / (1024**3), 1),
+            "used_gb": round(mem.used / (1024**3), 1),
+            "percent": mem.percent,
+        }
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            info["gpu_vram"] = {
+                "total_gb": round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1),
+                "allocated_gb": round(torch.cuda.memory_allocated(0) / (1024**3), 1),
+                "reserved_gb": round(torch.cuda.memory_reserved(0) / (1024**3), 1),
+            }
+    except Exception:
+        pass
+    return info
 
 
 async def _auto_load_vision_model(model: str):
-    """自动加载视觉模型（启动时调用）"""
-    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
+    """自动加载视觉模型（启动时，加载到系统内存 / 16GB 内存条），带控制台进度条"""
+    global VISION_MODEL_INSTANCE, VISION_CURRENT_MODEL, VISION_LOAD_STATS
     if not model or model not in VISION_MODEL_MAP:
         return
-    import torch
-    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 
-    model_id = VISION_MODEL_MAP[model]
-    model_dir = VISION_CACHE_DIR / ("models--" + model_id.replace("/", "--"))
-    if not model_dir.exists() or not any(model_dir.glob("snapshots/*")):
-        logger.warning(f"视觉模型未下载: {model}，跳过自动加载")
-        return
+    try:
+        import torch
+        from transformers import (
+            Qwen3VLForConditionalGeneration,
+            AutoProcessor,
+            BitsAndBytesConfig,
+        )
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
-    device_map = "auto"
-    logger.info(f"正在加载视觉模型: {model} ({model_id}) ...")
-    VISION_MODEL_INSTANCE = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_id, cache_dir=str(VISION_CACHE_DIR), device_map=device_map,
-        dtype=torch.bfloat16, quantization_config=bnb_config
-    )
-    VISION_PROCESSOR_INSTANCE = AutoProcessor.from_pretrained(model_id, cache_dir=str(VISION_CACHE_DIR))
-    VISION_CURRENT_MODEL = model
-    logger.info(f"视觉模型 {model} 已自动加载完成")
+        model_id = VISION_MODEL_MAP[model]
+        t0 = _time_module.time()
+        mem_before = _get_memory_info()
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+
+        # ── 阶段 1: 加载模型权重（GPU 加速量化，再移到 CPU） ──
+        def _load_model():
+            import torch
+            # 先用 GPU 做 4bit 量化（GPU 算这个极快，几十秒），再移到 CPU 内存
+            if torch.cuda.is_available():
+                try:
+                    print("  [GPU 加速] 利用显卡做 4bit 量化...", flush=True)
+                    model_obj = Qwen3VLForConditionalGeneration.from_pretrained(
+                        model_id,
+                        device_map="cuda:0",
+                        quantization_config=bnb_config,
+                        dtype=torch.bfloat16,
+                        trust_remote_code=True,
+                    )
+                    print("  [GPU → 内存] 量化完成，移回 16GB 内存条...", flush=True)
+                    model_obj.to("cpu")
+                    torch.cuda.empty_cache()
+                    return model_obj
+                except Exception as e:
+                    print(f"  [GPU 失败] {e}，回退到纯 CPU 加载...", flush=True)
+                    torch.cuda.empty_cache()
+
+            # CPU 加载（兜底，较慢）
+            print("  [CPU 加载] 纯 CPU 做 4bit 量化（较慢，约 5-8 分钟）...", flush=True)
+            return Qwen3VLForConditionalGeneration.from_pretrained(
+                model_id,
+                device_map={"": "cpu"},
+                quantization_config=bnb_config,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+
+        model_obj = await _run_with_spinner(
+            _load_model,
+            label=f"加载视觉模型: {model_id}",
+            desc_lines=[
+                "  [1/2] 加载模型权重（GPU 加速 4bit 量化 → 移回内存）...",
+            ],
+        )
+
+        # ── 阶段 2: 加载处理器 ──
+        processor = await _run_with_spinner(
+            lambda: AutoProcessor.from_pretrained(model_id, trust_remote_code=True),
+            label="加载处理器",
+            desc_lines=["  [2/2] 加载处理器...",],
+        )
+
+        VISION_MODEL_INSTANCE = (model_obj, processor)
+        VISION_CURRENT_MODEL = model
+
+        load_time = round(_time_module.time() - t0, 2)
+        mem_after = _get_memory_info()
+
+        VISION_LOAD_STATS = {
+            "mode": "CPU 内存常驻 + 推理时瞬移 GPU",
+            "model": model,
+            "load_time_seconds": load_time,
+            "memory_before": mem_before,
+            "memory_after": mem_after,
+        }
+        logger.info(
+            f"视觉模型 {model} 加载完成（16GB 内存条）| 耗时={load_time}s"
+        )
+    except ImportError as e:
+        logger.warning(f"缺少依赖，视觉模型跳过: {e}")
+    except Exception as e:
+        logger.error(f"视觉模型 {model} 加载失败: {e}")
 
 
-@app.get("/api/vision-model/status")
-def vision_model_status(model: str):
-    """检查本地视觉模型是否已下载和已加载"""
-    if model not in VISION_MODEL_MAP:
-        return {"downloaded": False, "loaded": False, "message": "未知模型"}
-    model_id = VISION_MODEL_MAP[model]
-    model_dir = VISION_CACHE_DIR / ("models--" + model_id.replace("/", "--"))
-    downloaded = model_dir.exists() and any(model_dir.glob("snapshots/*"))
-    loaded = VISION_MODEL_INSTANCE is not None and VISION_CURRENT_MODEL == model
-    return {
-        "downloaded": downloaded,
-        "loaded": loaded,
-        "model": model,
-        "model_path": str(model_dir) if downloaded else None
-    }
+async def _run_with_spinner(func, label: str, desc_lines: list):
+    """在后台线程执行 func，同时控制台显示旋转动画 + 计时"""
+    import sys
+    import threading
+
+    spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    done = threading.Event()
+    result = None
+    error = None
+    start_time = _time_module.time()
+
+    # 打印阶段描述
+    for line in desc_lines:
+        print(line, flush=True)
+
+    def _worker():
+        nonlocal result, error
+        try:
+            result = func()
+        except Exception as e:
+            error = e
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    # 旋转动画 + 计时
+    i = 0
+    while not done.wait(0.12):
+        elapsed = int(_time_module.time() - start_time)
+        spinner = spinner_chars[i % len(spinner_chars)]
+        sys.stdout.write(f"\r  {spinner} {label} ... {elapsed}s")
+        sys.stdout.flush()
+        i += 1
+
+    thread.join()
+
+    if error:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+        raise error
+
+    elapsed = round(_time_module.time() - start_time, 1)
+    sys.stdout.write(f"\r  ✓ {label} 完成 ({elapsed}s)\n")
+    sys.stdout.flush()
+
+    return result
 
 
 @app.post("/api/vision-model/download")
 async def vision_model_download(request: Request):
-    """下载本地视觉模型（SSE 流式进度）"""
-    import asyncio
-    
+    """下载 safetensors 格式视觉模型（HuggingFace 标准格式）"""
     body = await request.json()
     model = body.get("model", "")
     if model not in VISION_MODEL_MAP:
         return JSONResponse({"detail": "未知模型"}, status_code=400)
-    
+
     model_id = VISION_MODEL_MAP[model]
-    
+
     async def event_generator():
         try:
-            # 使用 Python 脚本下载模型
-            yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': '开始下载模型...'})}\n\n"
-            
+            yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': f'开始下载: {model_id}...'})}\n\n"
+
+            # 用 transformers 自动下载（会缓存到 ~/.cache/huggingface/）
+            import subprocess
             script = f"""
-import sys
-sys.path.insert(0, r'{os.path.dirname(os.path.abspath(__file__))}')
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-import torch
-import os
+import sys, os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 
 print("PROGRESS:10", flush=True)
-print("STATUS:下载模型配置...", flush=True)
+print("STATUS:下载模型权重...", flush=True)
 
-# 只下载，不加载
-from huggingface_hub import snapshot_download
-snapshot_download(
-    '{model_id}',
-    cache_dir=r'{VISION_CACHE_DIR}',
-    resume_download=True,
-    max_workers=4,
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+import torch
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
 )
+
+print("PROGRESS:30", flush=True)
+model = Qwen3VLForConditionalGeneration.from_pretrained(
+    '{model_id}',
+    device_map="cpu",
+    quantization_config=bnb_config,
+    dtype=torch.bfloat16,
+    trust_remote_code=True,
+)
+print("PROGRESS:70", flush=True)
+print("STATUS:下载处理器...", flush=True)
+processor = AutoProcessor.from_pretrained('{model_id}', trust_remote_code=True)
 print("PROGRESS:100", flush=True)
-print("COMPLETE", flush=True)
+print("DONE", flush=True)
 """
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-c", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "PYTHONIOENCODING": "utf-8", "HF_HUB_DISABLE_PROGRESS_BARS": "1"}
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
-            
             async for line in proc.stdout:
                 try:
-                    line = line.decode('utf-8', errors='replace').strip()
+                    line = line.decode("utf-8", errors="replace").strip()
                 except Exception:
                     continue
                 if line.startswith("PROGRESS:"):
@@ -1321,163 +1462,228 @@ print("COMPLETE", flush=True)
                     yield f"data: {json.dumps({'status': 'downloading', 'progress': pct})}\n\n"
                 elif line.startswith("STATUS:"):
                     msg = line.split(":", 1)[1]
-                    yield f"data: {json.dumps({'status': 'downloading', 'progress': vision_download_status.get(model, 0), 'message': msg})}\n\n"
-                elif line == "COMPLETE":
-                    yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'message': '模型下载完成！'})}\n\n"
-                    break
-            
+                    yield f"data: {json.dumps({'status': 'downloading', 'progress': 50, 'message': msg})}\n\n"
             await proc.wait()
-            if proc.returncode != 0:
-                yield f"data: {json.dumps({'status': 'error', 'message': '下载过程出错'})}\n\n"
-                
+
+            yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'message': f'{model_id} 下载完成！'})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
-    
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
 @app.post("/api/vision-model/load")
 async def vision_model_load(request: Request):
-    """加载本地视觉模型到内存"""
+    """加载视觉模型到系统内存（16GB 内存条），显存不占用"""
     body = await request.json()
     model = body.get("model", "")
     if model not in VISION_MODEL_MAP:
         return JSONResponse({"detail": "未知模型"}, status_code=400)
-    
-    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
-    
+
+    global VISION_MODEL_INSTANCE, VISION_CURRENT_MODEL, VISION_LOAD_STATS
+
     try:
         import torch
-        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
-        
+        from transformers import (
+            Qwen3VLForConditionalGeneration,
+            AutoProcessor,
+            BitsAndBytesConfig,
+        )
+
         model_id = VISION_MODEL_MAP[model]
-        
+        logger.info(f"加载视觉模型: {model}（→ 16GB 内存条）...")
+        t0 = _time_module.time()
+        mem_before = _get_memory_info()
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-        
-        VISION_MODEL_INSTANCE = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_id,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        VISION_PROCESSOR_INSTANCE = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+        # GPU 加速量化，再移回 CPU
+        if torch.cuda.is_available():
+            try:
+                logger.info("  [GPU 加速] 利用显卡做 4bit 量化...")
+                model_obj = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_id,
+                    device_map="cuda:0",
+                    quantization_config=bnb_config,
+                    dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                )
+                model_obj.to("cpu")
+                torch.cuda.empty_cache()
+                logger.info("  [GPU → 内存] 量化完成，已移回 16GB 内存条")
+            except Exception as e:
+                logger.warning(f"  [GPU 失败] {e}，回退到纯 CPU 加载")
+                torch.cuda.empty_cache()
+                model_obj = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_id,
+                    device_map={"": "cpu"},
+                    quantization_config=bnb_config,
+                    dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                )
+        else:
+            model_obj = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_id,
+                device_map={"": "cpu"},
+                quantization_config=bnb_config,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+        VISION_MODEL_INSTANCE = (model_obj, processor)
         VISION_CURRENT_MODEL = model
-        
-        return {"status": "ok", "message": f"模型 {model} 已加载"}
+
+        load_time = round(_time_module.time() - t0, 2)
+        mem_after = _get_memory_info()
+
+        VISION_LOAD_STATS = {
+            "mode": "CPU 内存常驻 + 推理时瞬移 GPU",
+            "model": model,
+            "load_time_seconds": load_time,
+            "memory_before": mem_before,
+            "memory_after": mem_after,
+        }
+        logger.info(
+            f"视觉模型 {model} 加载完成（16GB 内存条）| 耗时={load_time}s"
+        )
+
+        return {
+            "status": "ok",
+            "message": f"模型 {model} 已加载到 16GB 内存条，显存零占用",
+            "backend": "CPU 内存常驻 + 推理时瞬移 GPU",
+            "load_stats": VISION_LOAD_STATS,
+        }
+    except ImportError as e:
+        return {"status": "error", "message": f"缺少依赖: {e}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @app.post("/api/vision-model/unload")
 async def vision_model_unload():
-    """卸载本地视觉模型，释放 GPU 显存"""
-    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
-    import gc
-    import torch
-    
+    """卸载视觉模型，释放系统内存 + 显存"""
+    global VISION_MODEL_INSTANCE, VISION_CURRENT_MODEL
+
     if VISION_MODEL_INSTANCE is not None:
+        model_obj, _ = VISION_MODEL_INSTANCE
+        del model_obj
         del VISION_MODEL_INSTANCE
         VISION_MODEL_INSTANCE = None
-    if VISION_PROCESSOR_INSTANCE is not None:
-        del VISION_PROCESSOR_INSTANCE
-        VISION_PROCESSOR_INSTANCE = None
     VISION_CURRENT_MODEL = None
-    
-    gc.collect()
-    if torch.cuda.is_available():
+    _gc_module.collect()
+
+    try:
+        import torch
         torch.cuda.empty_cache()
-    
-    return {"status": "ok", "message": "模型已卸载，显存已释放"}
+    except Exception:
+        pass
+
+    return {"status": "ok", "message": "模型已卸载，内存 + 显存已释放"}
 
 
 @app.post("/api/vision-model/recognize")
 async def vision_model_recognize(request: Request):
-    """使用本地视觉模型识别图片"""
-    global VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE
-    
-    if VISION_MODEL_INSTANCE is None or VISION_PROCESSOR_INSTANCE is None:
+    """视觉识别：从 16GB 内存条瞬移到 GPU 推理，完成后瞬移回内存条"""
+    global VISION_MODEL_INSTANCE, VISION_INFER_STATS
+
+    if VISION_MODEL_INSTANCE is None:
         return JSONResponse({"detail": "视觉模型未加载，请先加载模型"}, status_code=400)
-    
+
+    model_obj, processor = VISION_MODEL_INSTANCE
+
     try:
         import torch
         from PIL import Image
         from io import BytesIO
         import base64
-        from qwen_vl_utils import process_vision_info
-        
+
         body = await request.json()
-        image_data = body.get("image", "")  # base64 encoded image
+        image_data = body.get("image", "")
         prompt = body.get("prompt", "请用中文简洁描述这张图片的主要内容。")
-        
+
         # 解码图片
         if image_data.startswith("data:"):
             image_data = image_data.split(",", 1)[1]
         image_bytes = base64.b64decode(image_data)
         pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
-        
-        # 缩放
-        max_size = 768
-        if max(pil_image.size) > max_size:
-            ratio = max_size / max(pil_image.size)
-            new_size = (int(pil_image.size[0] * ratio), int(pil_image.size[1] * ratio))
-            pil_image = pil_image.resize(new_size, Image.LANCZOS)
-        
-        # 构建消息
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": pil_image},
-                {"type": "text", "text": prompt},
-            ],
-        }]
-        
-        text_input = VISION_PROCESSOR_INSTANCE.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = VISION_PROCESSOR_INSTANCE(
-            text=[text_input],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            inputs = inputs.to(device)
-        
-        with torch.inference_mode():
-            generated_ids = VISION_MODEL_INSTANCE.generate(
-                **inputs,
-                max_new_tokens=100,
-                do_sample=False,
-            )
-        
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+
+        # 计时 & 内存快照
+        t0 = _time_module.time()
+        mem_before = _get_memory_info()
+
+        # ====== 关键步骤 1: 从 16GB 内存条瞬移到 GPU ======
+        gpu_available = torch.cuda.is_available()
+        move_start = _time_module.time()
+        if gpu_available:
+            model_obj.to("cuda")
+            torch.cuda.synchronize()
+        move_time = round(_time_module.time() - move_start, 3)
+
+        # ====== 关键步骤 2: 在 GPU 上推理 ======
+        infer_start = _time_module.time()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
         ]
-        output_text = VISION_PROCESSOR_INSTANCE.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-        
-        return {"status": "ok", "description": output_text.strip()}
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=text, images=[pil_image], return_tensors="pt")
+        if gpu_available:
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        with torch.no_grad():
+            generated_ids = model_obj.generate(**inputs, max_new_tokens=100, temperature=0)
+        generated_ids = generated_ids[:, inputs["input_ids"].shape[-1]:]
+        output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        infer_time = round(_time_module.time() - infer_start, 3)
+
+        # ====== 关键步骤 3: 推理完成，瞬移回 16GB 内存条 ======
+        move_back_start = _time_module.time()
+        if gpu_available:
+            model_obj.to("cpu")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        move_back_time = round(_time_module.time() - move_back_start, 3)
+
+        total_time = round(_time_module.time() - t0, 3)
+        mem_after = _get_memory_info()
+        est_tokens = max(1, len(output_text) // 2)
+
+        VISION_INFER_STATS = {
+            "mode": "CPU 内存常驻 + 推理瞬移 GPU",
+            "total_time_seconds": total_time,
+            "move_to_gpu_seconds": move_time,
+            "infer_seconds": infer_time,
+            "move_back_cpu_seconds": move_back_time,
+            "output_tokens_est": est_tokens,
+            "tokens_per_second_est": round(est_tokens / infer_time, 1) if infer_time > 0 else 0,
+            "memory_before": mem_before,
+            "memory_after": mem_after,
+        }
+        logger.info(
+            f"视觉识别完成 | 总耗时={total_time}s（移到GPU={move_time}s / 推理={infer_time}s / 移回内存={move_back_time}s）| "
+            f"速度≈{VISION_INFER_STATS['tokens_per_second_est']} tok/s"
+        )
+
+        return {
+            "status": "ok",
+            "description": output_text,
+            "infer_stats": VISION_INFER_STATS,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

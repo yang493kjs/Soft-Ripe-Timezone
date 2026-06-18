@@ -36,17 +36,14 @@ def _get_vision_client() -> Optional[OpenAI]:
 
 
 def _check_vision_support() -> bool:
-    """快速检测当前模型是否可能支持 vision（不发送请求）"""
+    """检测当前 API 模型是否支持 vision（纯关键词匹配，不发送请求）"""
     cl = _get_vision_client()
     if cl is None:
-        # 即使没有API客户端，也可能有本地视觉模型
-        return _has_local_vision()
-    # 常见 vision 模型关键词
+        return False
     model_name = (IMAGE_VISION_MODEL or current_model or "").lower()
     vision_keywords = ["gpt-4o", "gpt-4-turbo", "vision", "claude", "gemini",
                        "vl", "visual", "multimodal", "qwen-vl", "glm-4v"]
-    api_supports = any(kw in model_name for kw in vision_keywords)
-    return api_supports or _has_local_vision()
+    return any(kw in model_name for kw in vision_keywords)
 
 
 def _has_local_vision() -> bool:
@@ -200,11 +197,13 @@ def _try_local_vision(image_base64: str, mime_type: str = "image/png") -> Option
     """尝试使用本地视觉模型识别图片"""
     try:
         # 检查是否配置了本地视觉模型
-        from main import VISION_MODEL_INSTANCE, VISION_PROCESSOR_INSTANCE, VISION_CURRENT_MODEL
+        from main import VISION_MODEL_INSTANCE, VISION_CURRENT_MODEL
         
-        if VISION_MODEL_INSTANCE is None or VISION_PROCESSOR_INSTANCE is None:
+        if VISION_MODEL_INSTANCE is None:
             logger.info("[图片识别] 本地视觉模型未加载，跳过")
             return None
+        
+        model_obj, processor = VISION_MODEL_INSTANCE
         
         import torch
         from qwen_vl_utils import process_vision_info
@@ -231,11 +230,11 @@ def _try_local_vision(image_base64: str, mime_type: str = "image/png") -> Option
             ],
         }]
         
-        text_input = VISION_PROCESSOR_INSTANCE.apply_chat_template(
+        text_input = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
         image_inputs, video_inputs = process_vision_info(messages)
-        inputs = VISION_PROCESSOR_INSTANCE(
+        inputs = processor(
             text=[text_input],
             images=image_inputs,
             videos=video_inputs,
@@ -243,22 +242,28 @@ def _try_local_vision(image_base64: str, mime_type: str = "image/png") -> Option
             return_tensors="pt",
         )
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            inputs = inputs.to(device)
+        # 推理时瞬移到 GPU，推理完移回内存
+        use_gpu = torch.cuda.is_available()
+        if use_gpu:
+            model_obj.to("cuda")
+            inputs = inputs.to("cuda")
         
         with torch.inference_mode():
-            generated_ids = VISION_MODEL_INSTANCE.generate(
+            generated_ids = model_obj.generate(
                 **inputs,
                 max_new_tokens=100,
                 do_sample=False,
             )
         
+        if use_gpu:
+            model_obj.to("cpu")
+            torch.cuda.empty_cache()
+        
         generated_ids_trimmed = [
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        output_text = VISION_PROCESSOR_INSTANCE.batch_decode(
+        output_text = processor.batch_decode(
             generated_ids_trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,

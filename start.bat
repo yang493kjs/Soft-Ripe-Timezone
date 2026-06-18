@@ -98,7 +98,16 @@ echo   To stop: Close the server window, or press any key
 echo ============================================================
 echo.
 
-start "Soft-Ripe Timezone" cmd /c "title Soft-Ripe Timezone & python main.py & pause"
+REM 创建临时启动脚本避免 & 符号被当前 shell 解释
+set LAUNCHER=%TEMP%\sr_launcher.bat
+(
+echo @echo off
+echo title Soft-Ripe Timezone
+echo cd /d "%BACKEND_DIR%"
+echo python main.py
+echo pause
+) > "%LAUNCHER%"
+start "Soft-Ripe Timezone" "%LAUNCHER%"
 
 echo.
 echo Press any key to stop the server...

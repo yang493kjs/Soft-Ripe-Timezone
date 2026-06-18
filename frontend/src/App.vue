@@ -522,12 +522,29 @@
 
       <main class="chat-body" ref="chatBody">
         <div class="msg-list">
-          <div class="load-more-row" v-if="hasMoreMessages">
+          <!-- 加载状态 -->
+          <div class="chat-status-row" v-if="messagesLoading">
+            <div class="chat-status-loading">
+              <span class="chat-status-spinner"></span>
+              <span>正在加载聊天记录...</span>
+            </div>
+          </div>
+
+          <!-- 错误状态 -->
+          <div class="chat-status-row" v-else-if="messagesError">
+            <div class="chat-status-error">
+              <span class="chat-status-icon">⚠️</span>
+              <span>{{ messagesError }}</span>
+              <button class="chat-status-retry" @click="loadMessages()">重试</button>
+            </div>
+          </div>
+
+          <div class="load-more-row" v-if="hasMoreMessages && !messagesLoading && !messagesError">
             <button class="load-more-btn" @click="loadMoreMessages" :disabled="loadingMore">
               {{ loadingMore ? '加载中...' : '加载更多消息' }}
             </button>
           </div>
-          <div class="date-tag">
+          <div class="date-tag" v-if="messages.length > 0">
             <span>{{ dateTag }}</span>
           </div>
 
@@ -1100,6 +1117,7 @@ const doLogin = async () => {
       } else {
         const lastPersona = localStorage.getItem('sr_last_persona')
         if (lastPersona && personas.value.some(p => p.id === lastPersona)) {
+          initializingChat.value = true
           selectedPersona.value = lastPersona
           showPersonaPicker.value = false
           saveSession(currentUser.value, lastPersona)
@@ -1749,10 +1767,17 @@ const hasCurrentAgent = ref(false)
 const messages = ref([])
 const hasMoreMessages = ref(false)
 const loadingMore = ref(false)
+const messagesLoading = ref(false)
+const messagesError = ref('')
 
 const msgCount = computed(() => messages.value.length)
 
 const loadMessages = async (beforeId = null) => {
+  // 防止并发重复加载
+  if (messagesLoading.value && !beforeId) return
+
+  messagesLoading.value = true
+  messagesError.value = ''
   try {
     let url = `${API}/api/messages?persona_id=${selectedPersona.value}`
     if (beforeId) url += `&before_id=${beforeId}`
@@ -1780,7 +1805,16 @@ const loadMessages = async (beforeId = null) => {
       memuStatus.value = d.memu_status
     }
     scrollEnd()
-  } catch (e) { logError('loadMessages', e.message, e.stack); messages.value = []; hasCurrentAgent.value = false }
+  } catch (e) {
+    logError('loadMessages', e.message, e.stack)
+    if (!beforeId) {
+      messagesError.value = '加载聊天记录失败，请检查网络连接后刷新页面重试'
+      messages.value = []
+      hasCurrentAgent.value = false
+    }
+  } finally {
+    messagesLoading.value = false
+  }
 }
 
 const loadMoreMessages = async () => {
@@ -2375,6 +2409,7 @@ const scrollEnd = () => {
 }
 
 const startChatWithPersona = async (personaId) => {
+  initializingChat.value = true
   selectedPersona.value = personaId
   localStorage.setItem('sr_last_persona', personaId)
   showPersonaPicker.value = false
@@ -2628,12 +2663,16 @@ const doSend = async (combinedText, imageData = null) => {
   }
 }
 
+// 防止页面初始化时 watch 和 initChat() 同时触发 loadMessages() 导致竞态条件
+const initializingChat = ref(false)
+
 watch(selectedPersona, (val) => {
   localStorage.setItem('sr_last_persona', val)
   if (val && currentUser.value) {
     saveSession(currentUser.value, val)
   }
-  if (val) loadMessages()
+  // 页面初始化期间由 initChat() 统一加载消息，watcher 不重复加载
+  if (val && !initializingChat.value) loadMessages()
 })
 
 watch(showMemory, (val) => {
@@ -2659,14 +2698,19 @@ const priColor = (p) => {
 }
 
 const initChat = async () => {
-  await checkConfig()
-  await loadMessages()
-  if (messages.value.length === 0) {
-    messages.value = [
-      { _id: 1, content: '嗨，你好呀～', senderId: 'ai', timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }
-    ]
+  initializingChat.value = true
+  try {
+    await checkConfig()
+    await loadMessages()
+    if (messages.value.length === 0 && !messagesError.value) {
+      messages.value = [
+        { _id: 1, content: '嗨，你好呀～', senderId: 'ai', timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }
+      ]
+    }
+    scrollEnd()
+  } finally {
+    initializingChat.value = false
   }
-  scrollEnd()
 }
 
 onMounted(async () => {
@@ -2733,6 +2777,7 @@ onMounted(async () => {
       await adminLoadUsers()
       adminLoadVisionModelConfig()
     } else if (session.persona && personas.value.some(p => p.id === session.persona)) {
+      initializingChat.value = true
       selectedPersona.value = session.persona
       showPersonaPicker.value = false
       try {
@@ -2865,6 +2910,26 @@ body { font-family: var(--font); -webkit-font-smoothing: antialiased }
 .light .load-more-btn { color: #9a8a7a; border-color: rgba(0,0,0,.08) }
 .light .load-more-btn:hover { background: rgba(0,0,0,.03); border-color: rgba(0,0,0,.15) }
 .load-more-btn:disabled { opacity: .5; cursor: not-allowed }
+
+/* 聊天状态：加载中 / 错误 */
+.chat-status-row { display: flex; justify-content: center; align-items: center; padding: 40px 20px; min-height: 120px }
+.chat-status-loading { display: flex; align-items: center; gap: 10px; font-size: 13px; opacity: .7 }
+.dark .chat-status-loading { color: var(--night-muted) }
+.light .chat-status-loading { color: #9a8a7a }
+.chat-status-spinner { width: 18px; height: 18px; border: 2px solid rgba(128,128,128,.2); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite }
+@keyframes spin { to { transform: rotate(360deg) } }
+.chat-status-error { display: flex; flex-direction: column; align-items: center; gap: 10px; font-size: 13px; text-align: center }
+.dark .chat-status-error { color: var(--night-muted) }
+.light .chat-status-error { color: #9a8a7a }
+.chat-status-icon { font-size: 28px }
+.chat-status-retry {
+  font-size: 12px; padding: 6px 20px; border-radius: 99px; border: 1px solid; cursor: pointer;
+  transition: all .2s var(--ease); background: transparent;
+}
+.dark .chat-status-retry { color: var(--night-accent); border-color: rgba(201,151,110,.3) }
+.dark .chat-status-retry:hover { background: rgba(201,151,110,.1); border-color: rgba(201,151,110,.5) }
+.light .chat-status-retry { color: var(--warm-accent2); border-color: rgba(224,145,90,.3) }
+.light .chat-status-retry:hover { background: rgba(224,145,90,.1); border-color: rgba(224,145,90,.5) }
 
 .date-tag { display: flex; justify-content: center; padding: 12px 0 8px }
 .date-tag span { font-size: 11px; padding: 3px 12px; border-radius: 99px }
