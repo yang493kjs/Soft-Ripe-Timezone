@@ -511,6 +511,9 @@
               <button class="settings-drop-item" @click="openSettingsSub('appearance')">
                 <span class="drop-label">界面样式</span>
               </button>
+              <button class="settings-drop-item" @click="openSettingsSub('wechat')">
+                <span class="drop-label">微信连接</span>
+              </button>
               <button class="settings-drop-item" @click="doLogout">
                 <span class="drop-label">切换用户</span>
               </button>
@@ -733,6 +736,7 @@
               <button class="settings-sub-tab" :class="{ active: settingsSubMenu === 'persona' }" @click="settingsSubMenu = 'persona'">人设切换</button>
               <button class="settings-sub-tab" :class="{ active: settingsSubMenu === 'model' }" @click="settingsSubMenu = 'model'">模型设置</button>
               <button class="settings-sub-tab" :class="{ active: settingsSubMenu === 'appearance' }" @click="settingsSubMenu = 'appearance'">界面样式</button>
+              <button class="settings-sub-tab" :class="{ active: settingsSubMenu === 'wechat' }" @click="settingsSubMenu = 'wechat'">微信连接</button>
             </div>
             <button class="x-btn" @click="closeSettings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
           </div>
@@ -803,6 +807,71 @@
             <div class="panel-block">
               <h4>账号</h4>
               <button class="logout-btn" @click="doLogout">切换用户</button>
+            </div>
+          </div>
+
+          <!-- 微信连接子菜单 -->
+          <div class="settings-sub-content" v-if="settingsSubMenu === 'wechat'">
+            <div class="panel-block">
+              <h4>微信连接 <span v-if="wechatStatus.bound && wechatStatus.online" style="color:#4ade80">● 已连接</span><span v-else-if="wechatStatus.bound" style="color:#fb7185">● 离线</span><span v-else style="color:#888">● 未绑定</span></h4>
+
+              <!-- 未绑定状态：显示扫码登录 -->
+              <div v-if="!wechatStatus.bound" class="wechat-bind-area">
+                <p class="wechat-hint">扫码绑定你的微信，让 AI 伴侣也能在微信里陪伴你。</p>
+                <button class="config-btn" @click="startWeChatLogin" :disabled="wechatQrLoading">
+                  {{ wechatQrLoading ? '获取二维码中…' : '获取登录二维码' }}
+                </button>
+
+                <!-- 二维码展示 -->
+                <div class="wechat-qr-area" v-if="wechatQrImage">
+                  <img :src="wechatQrImage" alt="微信登录二维码" class="wechat-qr-img" />
+                  <p class="wechat-qr-tip">请用微信扫码确认登录</p>
+                  <p class="wechat-qr-status" v-if="wechatQrStatus">{{ wechatQrStatusText }}</p>
+                  <button class="config-btn config-btn-cancel" @click="cancelWeChatLogin">取消</button>
+                </div>
+              </div>
+
+              <!-- 已绑定状态：显示状态信息和操作 -->
+              <div v-else class="wechat-bound-area">
+                <div class="wechat-info-row">
+                  <span class="wechat-info-label">机器人 ID</span>
+                  <span class="wechat-info-value">{{ wechatStatus.bot_id }}</span>
+                </div>
+                <div class="wechat-info-row">
+                  <span class="wechat-info-label">连接状态</span>
+                  <span class="wechat-info-value" :class="{ 'status-online': wechatStatus.online, 'status-offline': !wechatStatus.online }">
+                    {{ wechatStatus.online ? '在线' : '离线' }}
+                  </span>
+                </div>
+                <div class="wechat-info-row">
+                  <span class="wechat-info-label">当前角色</span>
+                  <span class="wechat-info-value">{{ wechatStatus.current_persona }}</span>
+                </div>
+
+                <!-- 角色切换 -->
+                <div class="wechat-persona-switch" v-if="wechatPersonas.length > 0">
+                  <h5>切换微信端角色</h5>
+                  <div class="wechat-persona-list">
+                    <button
+                      v-for="p in wechatPersonas"
+                      :key="p.id"
+                      class="persona-chip"
+                      :class="{ picked: p.is_current }"
+                      @click="switchWeChatPersona(p.id)"
+                    >
+                      <div class="chip-text">
+                        <span class="chip-name">{{ p.name }}</span>
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                <button class="logout-btn" @click="deleteWeChatBot" :disabled="wechatDeleting">
+                  {{ wechatDeleting ? '解除绑定中…' : '解除绑定' }}
+                </button>
+              </div>
+
+              <p class="config-msg" v-if="wechatMsg">{{ wechatMsg }}</p>
             </div>
           </div>
         </div>
@@ -947,6 +1016,7 @@
 
 <script setup>
 import { ref, computed, nextTick, onMounted, watch } from 'vue'
+import QRCode from 'qrcode'
 
 const API = 'http://localhost:8765'
 
@@ -1277,6 +1347,23 @@ const theme = ref('dark')
 const showSettings = ref(false)
 const showSettingsMenu = ref(false)
 const settingsSubMenu = ref('model')
+
+// 微信连接状态
+const wechatStatus = ref({ bound: false, online: false, bot_id: '', current_persona: '' })
+const wechatQrImage = ref('')
+const wechatQrToken = ref('')
+const wechatQrLoading = ref(false)
+const wechatQrStatus = ref('')  // wait / scaned / confirmed / expired
+const wechatQrPollTimer = ref(null)
+const wechatPersonas = ref([])
+const wechatMsg = ref('')
+const wechatDeleting = ref(false)
+
+const wechatQrStatusText = computed(() => {
+  const map = { wait: '等待扫码…', scaned: '已扫码，请在手机上确认', confirmed: '登录成功！', expired: '二维码已过期' }
+  return map[wechatQrStatus.value] || ''
+})
+
 const showProfile = ref(false)
 const showMemory = ref(false)
 const showMonologue = ref(false)
@@ -1450,11 +1537,162 @@ const openSettingsSub = (sub) => {
   showSettingsMenu.value = false
   settingsSubMenu.value = sub
   showSettings.value = true
+  // 打开微信连接子菜单时加载状态
+  if (sub === 'wechat') {
+    loadWeChatStatus()
+    loadWeChatPersonas()
+  }
 }
 
 const closeSettings = () => {
   showSettings.value = false
   showSettingsMenu.value = false
+  // 关闭设置时停止二维码轮询
+  stopWeChatQrPoll()
+}
+
+// ==================== 微信连接功能 ====================
+
+const loadWeChatStatus = async () => {
+  try {
+    const resp = await apiFetch(`${API}/api/wechat/status`)
+    if (resp.ok) {
+      wechatStatus.value = await resp.json()
+    }
+  } catch (e) {
+    // 静默失败
+  }
+}
+
+const loadWeChatPersonas = async () => {
+  try {
+    const resp = await apiFetch(`${API}/api/wechat/personas`)
+    if (resp.ok) {
+      const d = await resp.json()
+      wechatPersonas.value = d.personas || []
+    }
+  } catch (e) {
+    // 静默失败
+  }
+}
+
+const startWeChatLogin = async () => {
+  wechatQrLoading.value = true
+  wechatMsg.value = ''
+  try {
+    const resp = await apiFetch(`${API}/api/wechat/qrcode`, { method: 'POST' })
+    const d = await resp.json()
+    if (d.qrcode_img_content) {
+      // qrcode_img_content 是一个 URL（如 https://liteapp.weixin.qq.com/q/...）
+      // 需要用 QRCode 库将其编码成二维码图片
+      wechatQrImage.value = await QRCode.toDataURL(d.qrcode_img_content, {
+        width: 240,
+        margin: 1,
+        color: { dark: '#000000', light: '#ffffff' }
+      })
+      wechatQrToken.value = d.qrcode
+      wechatQrStatus.value = 'wait'
+      startWeChatQrPoll()
+    } else {
+      wechatMsg.value = '获取二维码失败'
+    }
+  } catch (e) {
+    wechatMsg.value = `获取二维码失败: ${e.message}`
+  } finally {
+    wechatQrLoading.value = false
+  }
+}
+
+const startWeChatQrPoll = () => {
+  stopWeChatQrPoll()
+  wechatQrPollTimer.value = setInterval(async () => {
+    if (!wechatQrToken.value) {
+      stopWeChatQrPoll()
+      return
+    }
+    try {
+      const resp = await apiFetch(`${API}/api/wechat/qrstatus?qrcode=${encodeURIComponent(wechatQrToken.value)}`)
+      const d = await resp.json()
+      wechatQrStatus.value = d.status
+
+      if (d.status === 'confirmed') {
+        stopWeChatQrPoll()
+        wechatMsg.value = '微信连接成功！'
+        wechatStatus.value = { bound: true, online: true, bot_id: d.bot_id, current_persona: wechatStatus.value.current_persona || 'sunny' }
+        await loadWeChatPersonas()
+        // 2秒后清除二维码
+        setTimeout(() => { wechatQrImage.value = '' }, 2000)
+      } else if (d.status === 'expired') {
+        stopWeChatQrPoll()
+        wechatMsg.value = '二维码已过期，请重新获取'
+      }
+    } catch (e) {
+      // 轮询失败，继续
+    }
+  }, 2000)
+}
+
+const stopWeChatQrPoll = () => {
+  if (wechatQrPollTimer.value) {
+    clearInterval(wechatQrPollTimer.value)
+    wechatQrPollTimer.value = null
+  }
+}
+
+const cancelWeChatLogin = () => {
+  stopWeChatQrPoll()
+  wechatQrImage.value = ''
+  wechatQrToken.value = ''
+  wechatQrStatus.value = ''
+  wechatMsg.value = ''
+}
+
+const switchWeChatPersona = async (personaId) => {
+  wechatMsg.value = ''
+  try {
+    const resp = await apiFetch(`${API}/api/wechat/switch-persona`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ persona_id: personaId })
+    })
+    if (resp.ok) {
+      wechatStatus.value.current_persona = personaId
+      // 更新 personas 列表的 is_current
+      wechatPersonas.value = wechatPersonas.value.map(p => ({ ...p, is_current: p.id === personaId }))
+    } else {
+      const d = await resp.json().catch(() => ({}))
+      wechatMsg.value = d.detail || '切换角色失败'
+    }
+  } catch (e) {
+    wechatMsg.value = `切换角色失败: ${e.message}`
+  }
+}
+
+const deleteWeChatBot = async () => {
+  if (!wechatStatus.value.bot_id) return
+  if (!confirm('确定要解除微信绑定吗？解除后将无法在微信端与 AI 伴侣对话。')) return
+
+  wechatDeleting.value = true
+  wechatMsg.value = ''
+  try {
+    const resp = await apiFetch(`${API}/api/wechat/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bot_id: wechatStatus.value.bot_id })
+    })
+    if (resp.ok) {
+      wechatStatus.value = { bound: false, online: false, bot_id: '', current_persona: '' }
+      wechatPersonas.value = []
+      wechatMsg.value = '已解除绑定'
+    } else {
+      const d = await resp.json().catch(() => ({}))
+      wechatMsg.value = d.detail || '解除绑定失败'
+    }
+  } catch (e) {
+    wechatMsg.value = `解除绑定失败: ${e.message}`
+  } finally {
+    wechatDeleting.value = false
+  }
 }
 
 const setFontSize = (size) => {
@@ -3409,6 +3647,30 @@ body { font-family: var(--font); -webkit-font-smoothing: antialiased }
 .light .settings-sub-tab.active { background: rgba(224,145,90,.1); color: var(--warm-accent); }
 
 .settings-sub-content { animation: panel-up .25s var(--ease) }
+
+/* 微信连接 */
+.wechat-bind-area { display: flex; flex-direction: column; gap: 12px; }
+.wechat-hint { font-size: 0.8125rem; color: var(--text-2); margin: 0; line-height: 1.5; }
+.wechat-qr-area { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 16px; border-radius: var(--radius-sm); }
+.dark .wechat-qr-area { background: var(--night-3); }
+.light .wechat-qr-area { background: var(--warm-1); }
+.wechat-qr-img { width: 220px; height: 220px; object-fit: contain; border-radius: 8px; background: #fff; padding: 8px; }
+.wechat-qr-tip { font-size: 0.8125rem; color: var(--text-1); margin: 0; }
+.wechat-qr-status { font-size: 0.75rem; color: var(--text-2); margin: 0; }
+.config-btn-cancel { margin-top: 4px; background: transparent !important; color: var(--text-2) !important; border: 1px solid rgba(255,255,255,.15) !important; }
+.light .config-btn-cancel { border-color: rgba(0,0,0,.15) !important; }
+.wechat-bound-area { display: flex; flex-direction: column; gap: 12px; }
+.wechat-info-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+.light .wechat-info-row { border-bottom-color: rgba(0,0,0,.05); }
+.wechat-info-label { font-size: 0.8125rem; color: var(--text-2); }
+.wechat-info-value { font-size: 0.8125rem; color: var(--text-1); font-weight: 500; }
+.wechat-info-value.status-online { color: #4ade80; }
+.wechat-info-value.status-offline { color: #fb7185; }
+.wechat-persona-switch { margin-top: 8px; }
+.wechat-persona-switch h5 { font-size: 0.8125rem; margin: 0 0 8px 0; color: var(--text-1); }
+.wechat-persona-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.wechat-persona-list .persona-chip { padding: 6px 12px; }
+.wechat-persona-list .persona-chip .chip-text { display: flex; flex-direction: column; gap: 2px; }
 
 /* 视觉模型选择 */
 .vision-model-select { display: flex; flex-direction: column }

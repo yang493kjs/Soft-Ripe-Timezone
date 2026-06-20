@@ -18,3 +18,7 @@ torch>=2.1
 transformers>=4.44
 huggingface-hub>=0.24
 bitsandbytes>=0.43
+
+# 微信连接模块
+httpx>=0.27          # 异步 HTTP 客户端（iLink API + CDN 上传下载）
+pycryptodome>=3.20   # AES-128-ECB 加密解密（CDN 媒体传输）

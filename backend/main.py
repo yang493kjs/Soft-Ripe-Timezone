@@ -255,12 +255,25 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(webbrowser.open, "http://localhost:8765")
     logger.info("浏览器已自动打开")
 
+    # 初始化微信连接模块
+    try:
+        from wechat import init as wechat_init
+        await wechat_init()
+    except Exception as e:
+        logger.warning(f"微信模块初始化失败（非致命）: {e}", exc_info=True)
+
     try:
         yield
     except asyncio.CancelledError:
         # 优雅处理服务器关闭时的 asyncio 取消异常
         pass
     finally:
+        # 关闭微信模块
+        try:
+            from wechat import shutdown as wechat_shutdown
+            await wechat_shutdown()
+        except Exception as e:
+            logger.warning(f"微信模块关闭失败: {e}")
         logger.info("半熟时区 后端服务已停止")
 
 
@@ -1737,6 +1750,241 @@ os.makedirs(_AVATAR_DIR, exist_ok=True)
 os.makedirs(_EMOJI_DIR, exist_ok=True)
 app.mount("/avatars", StaticFiles(directory=_AVATAR_DIR), name="avatars")
 app.mount("/static/emojis", StaticFiles(directory=_EMOJI_DIR), name="emojis")
+
+# ==================== 微信连接 API ====================
+# 需求文档第六章：API 端点设计
+# 所有端点都需要 require_auth 鉴权（除扫码登录的轮询端点）
+
+from pydantic import Field as _Field
+from typing import List as _List
+
+
+class WeChatLoginRequest(BaseModel):
+    """发起微信扫码登录"""
+    pass
+
+
+class WeChatSwitchPersonaRequest(BaseModel):
+    """切换角色"""
+    persona_id: str
+
+
+class WeChatDeleteRequest(BaseModel):
+    """删除机器人"""
+    bot_id: str
+
+
+# 已处理过的二维码 token 集合，防止 confirmed 状态被重复处理
+_processed_qrcodes: set = set()
+
+
+@app.post("/api/wechat/qrcode")
+async def wechat_get_qrcode(user: dict = Depends(require_auth)):
+    """获取微信登录二维码
+
+    Returns:
+        qrcode: 二维码 token（用于后续状态查询）
+        qrcode_img_content: base64 编码的二维码图片
+    """
+    try:
+        from wechat import fetch_qr_code
+        resp = await fetch_qr_code()
+        return {
+            "qrcode": resp.qrcode,
+            "qrcode_img_content": resp.qrcode_img_content,
+        }
+    except Exception as e:
+        logger.error(f"获取微信二维码失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取二维码失败: {e}")
+
+
+@app.get("/api/wechat/qrstatus")
+async def wechat_poll_qrstatus(qrcode: str, user: dict = Depends(require_auth)):
+    """查询扫码状态（前端轮询）
+
+    Returns:
+        status: wait / scaned / confirmed / expired
+        confirmed 时包含 bot_id 等信息
+    """
+    try:
+        from wechat import poll_qr_status, build_credentials_from_qr, save_credentials
+        from wechat import get_bot_state_manager, get_monitor_manager
+
+        resp = await poll_qr_status(qrcode)
+
+        # 扫码确认 → 保存凭证并启动监控（仅处理一次）
+        if resp.status == "confirmed" and resp.bot_token:
+            # 防止重复处理：已处理过的 qrcode 直接返回缓存结果
+            if qrcode in _processed_qrcodes:
+                # 返回已绑定的 bot_id（从 bot_state 查询）
+                user_id = user["user_id"]
+                bot_state_mgr = get_bot_state_manager()
+                bot_id = bot_state_mgr.get_bot_by_user(user_id)
+                return {
+                    "status": "confirmed",
+                    "bot_id": bot_id or "",
+                    "user_id": user_id,
+                }
+
+            _processed_qrcodes.add(qrcode)
+            # 限制集合大小，避免内存泄漏
+            if len(_processed_qrcodes) > 100:
+                _processed_qrcodes.clear()
+
+            user_id = user["user_id"]
+            creds = build_credentials_from_qr(resp, user_id)
+            save_credentials(creds)
+
+            # 注册到 bot_state
+            bot_state_mgr = get_bot_state_manager()
+            bot_state_mgr.register_bot(creds.ilink_bot_id, user_id)
+
+            # 启动监控
+            monitor_mgr = get_monitor_manager()
+            await monitor_mgr.start_bot(creds)
+
+            # 启动主动消息循环
+            from wechat import get_proactive_manager
+            await get_proactive_manager().start_bot(creds)
+
+            return {
+                "status": "confirmed",
+                "bot_id": creds.ilink_bot_id,
+                "user_id": user_id,
+            }
+
+        return {"status": resp.status}
+    except Exception as e:
+        logger.error(f"查询扫码状态失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询扫码状态失败: {e}")
+
+
+@app.get("/api/wechat/status")
+async def wechat_get_status(user: dict = Depends(require_auth)):
+    """获取当前用户的微信机器人状态
+
+    Returns:
+        bound: 是否已绑定机器人
+        bot_id: 机器人 ID（已绑定时）
+        online: 是否在线（监控运行中）
+        current_persona: 当前角色
+    """
+    try:
+        from wechat import get_bot_state_manager, get_monitor_manager
+
+        user_id = user["user_id"]
+        bot_state_mgr = get_bot_state_manager()
+        bot_id = bot_state_mgr.get_bot_by_user(user_id)
+
+        if not bot_id:
+            return {"bound": False, "online": False}
+
+        monitor_mgr = get_monitor_manager()
+        online = monitor_mgr.is_running(bot_id)
+        current_persona = bot_state_mgr.get_current_persona(bot_id)
+
+        return {
+            "bound": True,
+            "bot_id": bot_id,
+            "online": online,
+            "current_persona": current_persona,
+        }
+    except Exception as e:
+        logger.error(f"获取微信状态失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取状态失败: {e}")
+
+
+@app.post("/api/wechat/switch-persona")
+async def wechat_switch_persona(req: WeChatSwitchPersonaRequest, user: dict = Depends(require_auth)):
+    """切换微信机器人的角色"""
+    try:
+        from wechat import get_bot_state_manager
+        from settings import PERSONAS
+
+        if req.persona_id not in PERSONAS:
+            raise HTTPException(status_code=400, detail=f"角色 {req.persona_id} 不存在")
+
+        user_id = user["user_id"]
+        bot_state_mgr = get_bot_state_manager()
+        bot_id = bot_state_mgr.get_bot_by_user(user_id)
+
+        if not bot_id:
+            raise HTTPException(status_code=400, detail="未绑定微信机器人")
+
+        success = bot_state_mgr.set_current_persona(bot_id, req.persona_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="切换角色失败")
+
+        return {"status": "ok", "current_persona": req.persona_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"切换角色失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"切换角色失败: {e}")
+
+
+@app.post("/api/wechat/delete")
+async def wechat_delete_bot(req: WeChatDeleteRequest, user: dict = Depends(require_auth)):
+    """删除微信机器人（停止监控 + 删除凭证）"""
+    try:
+        from wechat import delete_credentials, get_bot_state_manager
+        from wechat import get_monitor_manager, get_proactive_manager
+
+        user_id = user["user_id"]
+        bot_state_mgr = get_bot_state_manager()
+
+        # 验证该机器人确实归属当前用户
+        bot_user_id = bot_state_mgr.get_user_id(req.bot_id)
+        if bot_user_id != user_id:
+            raise HTTPException(status_code=403, detail="无权操作此机器人")
+
+        # 停止监控
+        monitor_mgr = get_monitor_manager()
+        await monitor_mgr.stop_bot(req.bot_id)
+
+        # 停止主动消息
+        proactive_mgr = get_proactive_manager()
+        await proactive_mgr.stop_bot(req.bot_id)
+
+        # 删除凭证
+        delete_credentials(req.bot_id)
+
+        # 注销 bot_state
+        bot_state_mgr.unregister_bot(req.bot_id)
+
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除微信机器人失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"删除失败: {e}")
+
+
+@app.get("/api/wechat/personas")
+async def wechat_get_personas(user: dict = Depends(require_auth)):
+    """获取可用角色列表（供前端切换角色用）"""
+    try:
+        from settings import PERSONAS
+        from wechat import get_bot_state_manager
+
+        user_id = user["user_id"]
+        bot_state_mgr = get_bot_state_manager()
+        bot_id = bot_state_mgr.get_bot_by_user(user_id)
+        current = bot_state_mgr.get_current_persona(bot_id) if bot_id else None
+
+        personas = []
+        for pid, info in PERSONAS.items():
+            personas.append({
+                "id": pid,
+                "name": info.get("name", pid),
+                "description": info.get("description", ""),
+                "is_current": pid == current,
+            })
+        return {"personas": personas, "current": current}
+    except Exception as e:
+        logger.error(f"获取角色列表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取角色列表失败: {e}")
+
 
 if os.path.isdir(_DIST_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(_DIST_DIR, "assets")), name="assets")
