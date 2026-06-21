@@ -214,11 +214,10 @@ def trigger_proactive(req: ProactiveTriggerReq, admin_user: str = Query(None)):
     }
     trigger_prompt = trigger_prompts.get(req.trigger_type, trigger_prompts["context"])
 
-    speech_dna = PERSONAS.get(persona_id, {}).get("speech_dna")
     ai_content = call_external_reply(
         agent["system_prompt"], agent_id, trigger_prompt,
         {"phase": emo.relationship.get("phase", "acquaintance"), "emotion": "平静", "confidence": 0.8, "key_observations": []},
-        persona_name, memu, emotion_system=emo, speech_dna=speech_dna
+        persona_name, memu, emotion_system=emo
     )
 
     ai_msg = {

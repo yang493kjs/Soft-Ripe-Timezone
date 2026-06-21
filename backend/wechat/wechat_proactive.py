@@ -92,7 +92,7 @@ class WeChatProactiveSender:
             engine = ProactiveMessageEngine(agent_id, persona_id)
             emo = EmotionSystem(agent_id)
             rel = emo.relationship
-            emotion = emo.get_current_emotion()
+            emotion = emo
             persona_name = PERSONAS.get(persona_id, {}).get("name", persona_id)
 
             # 尝试获取 memory engine（可选）
