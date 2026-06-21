@@ -1,4 +1,4 @@
-fastapi==0.115.0
+fastapi>=0.115.0
 uvicorn==0.30.0
 memu-py==0.2.2
 openai==1.109.1
