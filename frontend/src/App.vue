@@ -1018,7 +1018,7 @@
 import { ref, computed, nextTick, onMounted, watch } from 'vue'
 import QRCode from 'qrcode'
 
-const API = 'http://localhost:8765'
+const API = ''  // 相对路径，由 Nginx 反向代理或 vite proxy 处理
 
 const SESSION_KEY = 'sr_session'
 const SESSION_DAYS = 30

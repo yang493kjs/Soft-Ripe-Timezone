@@ -10,5 +10,12 @@ export default defineConfig({
         }
       }
     }
-  })]
+  })],
+  server: {
+    proxy: {
+      '/api': 'http://localhost:8765',
+      '/avatars': 'http://localhost:8765',
+      '/static': 'http://localhost:8765'
+    }
+  }
 })

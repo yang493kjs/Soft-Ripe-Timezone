@@ -1,4 +1,5 @@
 fastapi>=0.115.0
+python-multipart>=0.0.9
 uvicorn==0.30.0
 memu-py==0.2.2
 openai==1.109.1
